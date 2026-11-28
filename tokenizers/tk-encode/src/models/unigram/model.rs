@@ -55,6 +55,13 @@ impl std::fmt::Debug for Unigram {
 
 static K_UNK_PENALTY: f64 = 10.0;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct BestPathNode {
+    id: usize,
+    best_path_score: f64,
+    starts_at: Option<usize>,
+}
+
 #[inline]
 fn utf8_char_width(lead: u8) -> usize {
     if lead < 0x80 {
@@ -210,25 +217,6 @@ impl Unigram {
 
     fn encode_optimized(&self, sentence: &str) -> Result<Vec<String>> {
         // https://github.com/google/sentencepiece/blob/d48247191a6d50e469ed1a4a36e877befffd1851/src/unigram_model.cc#L600
-        #[derive(Debug, Clone)]
-        struct BestPathNode {
-            /// The vocab id. (maybe UNK)
-            id: usize,
-            /// The total score of the best path ending at this node.
-            best_path_score: f64,
-            /// The starting position (in utf-8) of this node. The entire best
-            /// path can be constructed by backtracking along this link.
-            starts_at: Option<usize>,
-        }
-        impl Default for BestPathNode {
-            fn default() -> Self {
-                Self {
-                    id: 0,
-                    best_path_score: 0.0,
-                    starts_at: None,
-                }
-            }
-        }
         let size = sentence.len();
         let unk_score = self.min_score - K_UNK_PENALTY;
         let unk_id = self.unk_id;
@@ -295,6 +283,129 @@ impl Unigram {
         }
         results.reverse();
         Ok(results)
+    }
+
+    fn encode_ids_optimized(
+        &self,
+        sentence: &str,
+        best_path: &mut Vec<BestPathNode>,
+        path: &mut Vec<(usize, usize, usize)>,
+        ids: &mut Vec<u32>,
+    ) -> Result<()> {
+        let size = sentence.len();
+        let unk_score = self.min_score - K_UNK_PENALTY;
+        let unk_id = self.unk_id;
+
+        best_path.clear();
+        best_path.resize(size + 1, BestPathNode::default());
+        let mut starts_at = 0;
+        while starts_at < size {
+            let best_path_score_till_here = best_path[starts_at].best_path_score;
+            let mut has_single_node = false;
+            let mblen = utf8_char_width(sentence.as_bytes()[starts_at]);
+            for (length, id) in self
+                .trie
+                .common_prefix_search_values(sentence[starts_at..].bytes())
+            {
+                let key_pos = starts_at + length;
+                let target_node = &mut best_path[key_pos];
+                let score = self.scores[id as usize];
+                let candidate_best_path_score = score + best_path_score_till_here;
+                if target_node.starts_at.is_none()
+                    || candidate_best_path_score > target_node.best_path_score
+                {
+                    target_node.best_path_score = candidate_best_path_score;
+                    target_node.starts_at = Some(starts_at);
+                    target_node.id = id as usize;
+                }
+                if !has_single_node && length == mblen {
+                    has_single_node = true;
+                }
+            }
+            if !has_single_node {
+                let target_node = &mut best_path[starts_at + mblen];
+                let candidate_best_path_score = unk_score + best_path_score_till_here;
+                if target_node.starts_at.is_none()
+                    || candidate_best_path_score > target_node.best_path_score
+                {
+                    target_node.best_path_score = candidate_best_path_score;
+                    target_node.starts_at = Some(starts_at);
+                    target_node.id = unk_id.ok_or(UnigramError::MissingUnkId)?;
+                }
+            }
+            starts_at += mblen;
+        }
+
+        path.clear();
+        let mut ends_at = size;
+        while ends_at > 0 {
+            let node = &best_path[ends_at];
+            let starts_at = node.starts_at.unwrap();
+            path.push((starts_at, ends_at, node.id));
+            ends_at = starts_at;
+        }
+
+        ids.clear();
+        let unk_id = unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let mut fused: Option<(usize, usize)> = None;
+        for &(start, end, id) in path.iter().rev() {
+            if self.fuse_unk && id == unk_id {
+                fused = Some(match fused {
+                    Some((first, _)) => (first, end),
+                    None => (start, end),
+                });
+                continue;
+            }
+            if let Some((first, last)) = fused.take() {
+                self.push_piece(&sentence[first..last], ids)?;
+            }
+            if id == unk_id {
+                self.push_unknown(&sentence[start..end], ids)?;
+            } else {
+                ids.push(id as u32);
+            }
+        }
+        if let Some((first, last)) = fused {
+            self.push_piece(&sentence[first..last], ids)?;
+        }
+        Ok(())
+    }
+
+    fn push_piece(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        match self.token_to_ids.token_to_id(text) {
+            Some(id) => {
+                ids.push(id);
+                Ok(())
+            }
+            None => self.push_unknown(text, ids),
+        }
+    }
+
+    fn push_unknown(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        if self.byte_fallback {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let start = ids.len();
+            let mut covered = true;
+            for byte in text.bytes() {
+                let mut token = *b"<0x00>";
+                token[3] = HEX[(byte >> 4) as usize];
+                token[4] = HEX[(byte & 0x0f) as usize];
+                let token = std::str::from_utf8(&token).unwrap();
+                match self.token_to_ids.token_to_id(token) {
+                    Some(id) => ids.push(id),
+                    None => {
+                        covered = false;
+                        break;
+                    }
+                }
+            }
+            if covered {
+                return Ok(());
+            }
+            ids.truncate(start);
+        }
+        ids.push(self.unk_id.ok_or(UnigramError::MissingUnkId)? as u32);
+        Ok(())
     }
 
     fn encode_unoptimized(&self, sentence: &str) -> Result<Vec<String>> {
@@ -396,6 +507,9 @@ impl Unigram {
 pub struct UnigramScratch {
     /// Outlives the encode call that fills it, or it would never see a word twice.
     pub(crate) word_cache: WordCache,
+    best_path: Vec<BestPathNode>,
+    path: Vec<(usize, usize, usize)>,
+    ids: Vec<u32>,
 }
 
 impl pipeline::Tokenize for Unigram {
@@ -404,6 +518,9 @@ impl pipeline::Tokenize for Unigram {
     fn init_scratch(&self) -> Self::Scratch {
         Self::Scratch {
             word_cache: WordCache::new(DEFAULT_CACHE_CAPACITY),
+            best_path: Vec::new(),
+            path: Vec::new(),
+            ids: Vec::new(),
         }
     }
 
@@ -430,30 +547,27 @@ impl pipeline::Tokenize for Unigram {
         }
 
         let start = output.len();
-        for string in self.encode(sequence)? {
-            match self.token_to_ids.token_to_id(&string) {
-                Some(id) => {
-                    output.push(Token::from(id));
-                }
-                None => {
-                    if self.byte_fallback {
-                        let byte_token_ids: Option<Vec<_>> = string
-                            .bytes()
-                            .map(|byte| {
-                                let byte_string = format!("<0x{byte:02X}>");
-                                self.token_to_ids.token_to_id(&byte_string)
-                            })
-                            .collect();
-                        if let Some(token_ids) = byte_token_ids {
-                            output.extend(token_ids.iter().copied().map(Token::from));
-                            continue;
-                        }
+        if self.is_optimized && !self.samples() {
+            self.encode_ids_optimized(
+                sequence,
+                &mut scratch.best_path,
+                &mut scratch.path,
+                &mut scratch.ids,
+            )?;
+            output.extend(scratch.ids.iter().copied().map(Token::from));
+        } else {
+            for string in self.encode(sequence)? {
+                match self.token_to_ids.token_to_id(&string) {
+                    Some(id) => {
+                        output.push(Token::from(id));
                     }
-                    output.push(Token::from(
-                        self.unk_id.ok_or(UnigramError::MissingUnkId)? as u32
-                    ));
-                }
-            };
+                    None => {
+                        scratch.ids.clear();
+                        self.push_unknown(&string, &mut scratch.ids)?;
+                        output.extend(scratch.ids.iter().copied().map(Token::from));
+                    }
+                };
+            }
         }
 
         // Sampling skipped the lookup, so `placement` is `None` and this stores

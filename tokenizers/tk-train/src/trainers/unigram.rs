@@ -803,6 +803,7 @@ mod tests {
             .do_train(vec![("The".into(), 12), ("are".into(), 11)], &mut unigram)
             .unwrap();
 
+        assert_eq!(unigram.unk_id(), Some(0)); // #748
         let mut pieces = unigram.iter();
         assert_eq!(pieces.next(), Some(&("[UNK]".into(), 0.0)));
         assert_eq!(pieces.next(), Some(&("[SEP]".into(), 0.0)));
@@ -864,6 +865,87 @@ mod tests {
         let mut pieces = unigram.iter();
         assert_eq!(pieces.next(), Some(&("[SEP]".into(), 0.0)));
         assert_eq!(pieces.next(), Some(&("[CLS]".into(), 0.0)));
+    }
+
+    #[test]
+    fn training_matches_the_pre_optimization_trainer_bit_for_bit() {
+        // Golden from d3842788.
+        let trainer = UnigramTrainerBuilder::default()
+            .show_progress(false)
+            .vocab_size(12)
+            .n_sub_iterations(2)
+            .shrinking_factor(0.75)
+            .max_piece_length(16)
+            .seed_size(1_000_000)
+            .build()
+            .unwrap();
+        let mut model = Unigram::default();
+        trainer
+            .do_train(
+                vec![("abababab abab abababab abab".to_string(), 40)],
+                &mut model,
+            )
+            .unwrap();
+
+        let mut actual: Vec<(String, u64)> = model
+            .iter()
+            .map(|(piece, score)| (piece.clone(), score.to_bits()))
+            .collect();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let expected: Vec<(String, u64)> = [
+            (" ", 0xbff2758d0baf93c2),
+            (" abab", 0xc01af03328d5e770),
+            ("a", 0xc00bdb1b749a8ee1),
+            ("abab abab", 0xc01a08661090eaa6),
+            ("abababab abab", 0xbfe029f091506dc8),
+            ("b", 0xc01af03328d5e770),
+            ("bababab abab", 0xc00c1ea0b7daec54),
+        ]
+        .iter()
+        .map(|(piece, bits)| ((*piece).to_string(), *bits))
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn empty_and_varying_lengths_train() {
+        // #457
+        let sentences = vec![
+            ("".to_string(), 9),
+            ("a".to_string(), 30),
+            ("abcdefghij".to_string(), 20),
+            ("ab".to_string(), 18),
+            ("abcdefghijklmnopqrstuvwxyz".to_string(), 12),
+            ("日本語".to_string(), 8),
+            ("a".repeat(300), 3),
+            ("ab".to_string(), 7),
+        ];
+        let trainer = UnigramTrainerBuilder::default()
+            .show_progress(false)
+            .vocab_size(64)
+            .max_piece_length(16)
+            .build()
+            .unwrap();
+        let mut model = Unigram::default();
+        trainer.do_train(sentences, &mut model).unwrap();
+        assert!(!model.is_empty());
+    }
+
+    #[test]
+    fn a_vocabulary_smaller_than_the_alphabet_is_rejected() {
+        // #1179
+        let trainer = UnigramTrainerBuilder::default()
+            .show_progress(false)
+            .vocab_size(3)
+            .build()
+            .unwrap();
+        let mut model = Unigram::default();
+        assert!(
+            trainer
+                .do_train(vec![("abcdef".to_string(), 10)], &mut model)
+                .is_err()
+        );
     }
 
     #[test]
